@@ -1,32 +1,28 @@
 # ============================================================
-# OKX 5DK SCALPING SCANNER + TELEGRAM BOT
+# OKX 5DK SCALPING SCANNER + TELEGRAM
+# Sadece GÜÇLÜ AL ve GÜÇLÜ SAT sinyalleri gelir
 # !pip install requests pandas tabulate -q
 # ============================================================
 
 import requests
 import pandas as pd
 import numpy as np
-from tabulate import tabulate
 from datetime import datetime
 import time
 import warnings
 warnings.filterwarnings('ignore')
 
 # ─────────────────────────────────────────────
-# 🔑 TELEGRAM AYARLARI
+# 🔑 AYARLAR
 # ─────────────────────────────────────────────
 TELEGRAM_TOKEN   = "8562386030:AAFrIQHro3aHO9MrGZEkjJHZHdyimy87sZY"
 TELEGRAM_CHAT_ID = "807512251"
 
-# ─────────────────────────────────────────────
-# TARAMA AYARLARI
-# ─────────────────────────────────────────────
-TIMEFRAME        = "5m"
-LIMIT_CANDLES    = 200
-TOP_N_COINS      = 50
-MIN_VOLUME_USD   = 5_000_000
-SCAN_INTERVAL    = 300
-MIN_SCORE_ALERT  = 4
+TIMEFRAME       = "5m"
+LIMIT_CANDLES   = 200
+TOP_N_COINS     = 50
+MIN_VOLUME_USD  = 5_000_000
+MIN_SCORE_ALERT = 6   # Sadece 6 ve üstü AL, -6 ve altı SAT gelsin
 
 BASE_OKX = "https://www.okx.com"
 HEADERS  = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
@@ -43,17 +39,8 @@ def send_telegram(message):
             "parse_mode": "HTML"
         }, timeout=10)
         return r.json().get("ok", False)
-    except Exception as e:
-        print(f"Telegram hata: {e}")
+    except:
         return False
-
-def test_telegram():
-    ok = send_telegram("🤖 <b>OKX Scanner aktif!</b>\n5 dakikada bir sinyal gelecek. ✅")
-    if ok:
-        print("✅ Telegram bağlantısı başarılı! Telefonunu kontrol et.")
-    else:
-        print("❌ Telegram hatası!")
-    return ok
 
 # ─────────────────────────────────────────────
 # İNDİKATÖRLER
@@ -150,7 +137,6 @@ def generate_signal(df, inst_id):
     price = c.iloc[i]
     score = 0
 
-    # AL puanları
     if e9.iloc[i] > e21.iloc[i] > e50.iloc[i]: score += 2
     elif e9.iloc[i] > e21.iloc[i]:              score += 1
     if price > e200.iloc[i]:                    score += 1
@@ -162,7 +148,6 @@ def generate_signal(df, inst_id):
     if sk_.iloc[i] < 30 and sk_.iloc[i] > sd_.iloc[i]: score += 1
     if bbp_.iloc[i] < 0.30: score += 1
 
-    # SAT puanları
     if e9.iloc[i] < e21.iloc[i] < e50.iloc[i]: score -= 2
     elif e9.iloc[i] < e21.iloc[i]:              score -= 1
     if price < e200.iloc[i]:                    score -= 1
@@ -206,7 +191,6 @@ def format_signal_message(row):
         f"📊 Skor    : <b>{row['score']:+d}</b>  |  {direction}\n"
         f"📈 RSI     : {row['rsi']}\n"
         f"📉 BB%     : {row['bb_pct']}\n"
-        f"✅ EMA 9>21: {'Evet' if row['ema_ok'] else 'Hayır'}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 TP      : <code>{row['tp']}</code>\n"
         f"🛑 SL      : <code>{row['sl']}</code>\n"
@@ -215,38 +199,23 @@ def format_signal_message(row):
         f"🕐 {datetime.now().strftime('%H:%M:%S')}"
     )
 
-def format_summary(results, scan_time):
-    buy  = sum(1 for r in results if r["score"] >= MIN_SCORE_ALERT)
-    sell = sum(1 for r in results if r["score"] <= -MIN_SCORE_ALERT)
-    return (
-        f"📡 <b>OKX TARAMA ÖZETI</b>\n"
-        f"🕐 {scan_time}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 AL  sinyali : <b>{buy}</b> coin\n"
-        f"🔴 SAT sinyali : <b>{sell}</b> coin\n"
-        f"⚪ Bekle       : <b>{len(results)-buy-sell}</b> coin\n"
-        f"📊 Toplam      : {len(results)} coin\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Eğitim amaçlıdır!"
-    )
-
 # ─────────────────────────────────────────────
 # ANA TARAMA
 # ─────────────────────────────────────────────
 def run_scan():
     scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n{'='*55}")
-    print(f"  OKX 5DK SCANNER  |  {scan_time}")
-    print(f"{'='*55}")
+    print(f"\n{'='*50}")
+    print(f"  OKX SCANNER  |  {scan_time}")
+    print(f"{'='*50}")
 
     try:
         coins = get_top_coins(TOP_N_COINS)
     except Exception as e:
         print(f"❌ {e}")
-        return None
+        return
 
-    print(f"  ✅ {len(coins)} coin bulundu, taranıyor...\n")
-    results = []
+    print(f"  ✅ {len(coins)} coin taranıyor...\n")
+    guclu_sinyal = 0
 
     for i, inst in enumerate(coins, 1):
         try:
@@ -254,38 +223,40 @@ def run_scan():
             if df is None or len(df) < 60:
                 continue
             row = generate_signal(df, inst)
-            results.append(row)
 
-            marker = "🟢" if row["score"]>=4 else "🔴" if row["score"]<=-4 else "⚪"
-            print(f"  [{i:02d}] {row['coin']:<12} {marker} {row['signal']:<18} {row['score']:+d}")
-
-            # Güçlü sinyal → Telegram'a gönder
-            if abs(row["score"]) >= MIN_SCORE_ALERT:
+            # Sadece güçlü sinyalleri göster ve gönder
+            if row["score"] >= MIN_SCORE_ALERT:
+                print(f"  🟢 GÜÇLÜ AL → {row['coin']} | Skor:{row['score']:+d} | RSI:{row['rsi']}")
                 send_telegram(format_signal_message(row))
+                guclu_sinyal += 1
                 time.sleep(0.5)
+            elif row["score"] <= -MIN_SCORE_ALERT:
+                print(f"  🔴 GÜÇLÜ SAT → {row['coin']} | Skor:{row['score']:+d} | RSI:{row['rsi']}")
+                send_telegram(format_signal_message(row))
+                guclu_sinyal += 1
+                time.sleep(0.5)
+            else:
+                print(f"  ⚪ {row['coin']:<12} {row['signal']}")
 
             time.sleep(0.12)
         except:
             continue
 
-    if not results:
-        print("❌ Sonuç alınamadı!")
-        return None
+    if guclu_sinyal == 0:
+        print("\n  ⚪ Bu taramada güçlü sinyal bulunamadı.")
+        send_telegram(
+            f"📡 <b>OKX Tarama Tamamlandı</b>\n"
+            f"🕐 {scan_time}\n"
+            f"⚪ Güçlü sinyal bulunamadı.\n"
+            f"📊 {len(coins)} coin tarandı."
+        )
+    else:
+        send_telegram(
+            f"✅ <b>Tarama bitti</b> — {guclu_sinyal} güçlü sinyal bulundu.\n"
+            f"🕐 {scan_time}"
+        )
 
-    # Özet mesaj
-    send_telegram(format_summary(results, scan_time))
-
-    # Konsol tablosu
-    df_res = pd.DataFrame(results)
-    print(f"\n{'='*55}")
-    print(tabulate(
-        df_res.sort_values("score", ascending=False)
-              [["coin","price","signal","score","rsi","bb_pct","tp","sl","rr"]],
-        headers=["Coin","Fiyat","Sinyal","Skor","RSI","BB%","TP","SL","R/R"],
-        tablefmt="fancy_grid", showindex=False))
-
-    print(f"\n✅ Tamamlandı — {datetime.now().strftime('%H:%M:%S')}")
-    return df_res
+    print(f"\n✅ Tamamlandı — {guclu_sinyal} güçlü sinyal")
 
 # ─────────────────────────────────────────────
 # ÇALIŞTIR
