@@ -1,0 +1,307 @@
+# ============================================================
+# OKX 5DK SCALPING SCANNER + TELEGRAM BOT
+# !pip install requests pandas tabulate -q
+# ============================================================
+
+import requests
+import pandas as pd
+import numpy as np
+from tabulate import tabulate
+from datetime import datetime
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# ─────────────────────────────────────────────
+# 🔑 TELEGRAM AYARLARI
+# ─────────────────────────────────────────────
+TELEGRAM_TOKEN   = "8562386030:AAFrIQHro3aHO9MrGZEkjJHZHdyimy87sZY"
+TELEGRAM_CHAT_ID = "807512251"
+
+# ─────────────────────────────────────────────
+# TARAMA AYARLARI
+# ─────────────────────────────────────────────
+TIMEFRAME        = "5m"
+LIMIT_CANDLES    = 200
+TOP_N_COINS      = 50
+MIN_VOLUME_USD   = 5_000_000
+SCAN_INTERVAL    = 300
+MIN_SCORE_ALERT  = 4
+
+BASE_OKX = "https://www.okx.com"
+HEADERS  = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+# ─────────────────────────────────────────────
+# TELEGRAM
+# ─────────────────────────────────────────────
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        r = requests.post(url, json={
+            "chat_id"   : TELEGRAM_CHAT_ID,
+            "text"      : message,
+            "parse_mode": "HTML"
+        }, timeout=10)
+        return r.json().get("ok", False)
+    except Exception as e:
+        print(f"Telegram hata: {e}")
+        return False
+
+def test_telegram():
+    ok = send_telegram("🤖 <b>OKX Scanner aktif!</b>\n5 dakikada bir sinyal gelecek. ✅")
+    if ok:
+        print("✅ Telegram bağlantısı başarılı! Telefonunu kontrol et.")
+    else:
+        print("❌ Telegram hatası!")
+    return ok
+
+# ─────────────────────────────────────────────
+# İNDİKATÖRLER
+# ─────────────────────────────────────────────
+def ema(s, p):
+    return s.ewm(span=p, adjust=False).mean()
+
+def rsi(s, p=14):
+    d = s.diff()
+    g = d.clip(lower=0).ewm(com=p-1, adjust=False).mean()
+    l = (-d.clip(upper=0)).ewm(com=p-1, adjust=False).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+def macd(s, f=12, sl=26, sig=9):
+    m  = ema(s, f) - ema(s, sl)
+    sg = ema(m, sig)
+    return m, sg, m - sg
+
+def bollinger(s, p=20, k=2):
+    mid = s.rolling(p).mean()
+    std = s.rolling(p).std()
+    up  = mid + k * std
+    lo  = mid - k * std
+    pct = (s - lo) / (up - lo).replace(0, np.nan)
+    return up, mid, lo, pct
+
+def atr(h, l, c, p=14):
+    tr = pd.concat([(h-l), (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(com=p-1, adjust=False).mean()
+
+def stoch(h, l, c, k=14, d=3):
+    lo = l.rolling(k).min()
+    hi = h.rolling(k).max()
+    sk = 100 * (c - lo) / (hi - lo).replace(0, np.nan)
+    return sk, sk.rolling(d).mean()
+
+# ─────────────────────────────────────────────
+# OKX API
+# ─────────────────────────────────────────────
+def safe_get(url, params=None):
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            if r.status_code == 200 and r.text.strip():
+                return r.json()
+            time.sleep(1)
+        except:
+            time.sleep(2)
+    return None
+
+def get_top_coins(n=50):
+    data = safe_get(f"{BASE_OKX}/api/v5/market/tickers", {"instType": "SWAP"})
+    if not data:
+        raise Exception("OKX'ten veri alınamadı!")
+    rows = []
+    for t in data.get("data", []):
+        if not t["instId"].endswith("-USDT-SWAP"):
+            continue
+        try:
+            vol   = float(t.get("volCcy24h", 0) or 0)
+            price = float(t.get("last", 0) or 0)
+            if vol * price >= MIN_VOLUME_USD:
+                rows.append({"instId": t["instId"], "vol_usd": vol * price})
+        except:
+            continue
+    df = pd.DataFrame(rows).sort_values("vol_usd", ascending=False).head(n)
+    return df["instId"].tolist()
+
+def get_candles(inst_id, bar="5m", limit=200):
+    data = safe_get(f"{BASE_OKX}/api/v5/market/candles",
+                    {"instId": inst_id, "bar": bar, "limit": limit})
+    if not data or not data.get("data"):
+        return None
+    df = pd.DataFrame(data["data"],
+                      columns=["ts","open","high","low","close","vol","volCcy","volCcyQuote","confirm"])
+    df = df[["ts","open","high","low","close","vol"]].astype(float)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+    return df.sort_values("ts").reset_index(drop=True)
+
+# ─────────────────────────────────────────────
+# SİNYAL MOTORU
+# ─────────────────────────────────────────────
+def generate_signal(df, inst_id):
+    c, h, l, v = df["close"], df["high"], df["low"], df["vol"]
+
+    e9, e21, e50, e200 = ema(c,9), ema(c,21), ema(c,50), ema(c,200)
+    rsi_  = rsi(c)
+    m_, ms_, mh_ = macd(c)
+    _, _, _, bbp_ = bollinger(c)
+    atr_  = atr(h, l, c)
+    sk_, sd_ = stoch(h, l, c)
+
+    i, p  = -1, -2
+    price = c.iloc[i]
+    score = 0
+
+    # AL puanları
+    if e9.iloc[i] > e21.iloc[i] > e50.iloc[i]: score += 2
+    elif e9.iloc[i] > e21.iloc[i]:              score += 1
+    if price > e200.iloc[i]:                    score += 1
+    rv = rsi_.iloc[i]
+    if 40 < rv < 65:  score += 1
+    elif rv < 35:     score += 1
+    if mh_.iloc[i] > 0 and mh_.iloc[i] > mh_.iloc[p]: score += 2
+    if m_.iloc[p] < ms_.iloc[p] and m_.iloc[i] > ms_.iloc[i]: score += 2
+    if sk_.iloc[i] < 30 and sk_.iloc[i] > sd_.iloc[i]: score += 1
+    if bbp_.iloc[i] < 0.30: score += 1
+
+    # SAT puanları
+    if e9.iloc[i] < e21.iloc[i] < e50.iloc[i]: score -= 2
+    elif e9.iloc[i] < e21.iloc[i]:              score -= 1
+    if price < e200.iloc[i]:                    score -= 1
+    if rv > 70:    score -= 2
+    elif rv > 65:  score -= 1
+    if mh_.iloc[i] < 0 and mh_.iloc[i] < mh_.iloc[p]: score -= 2
+    if m_.iloc[p] > ms_.iloc[p] and m_.iloc[i] < ms_.iloc[i]: score -= 2
+    if sk_.iloc[i] > 70 and sk_.iloc[i] < sd_.iloc[i]: score -= 1
+    if bbp_.iloc[i] > 0.70: score -= 1
+
+    if score >= 6:    signal = "🟢 GÜÇLÜ AL"
+    elif score >= 4:  signal = "🔵 AL"
+    elif score >= 2:  signal = "🔷 ZAYIF AL"
+    elif score <= -6: signal = "🔴 GÜÇLÜ SAT"
+    elif score <= -4: signal = "🟠 SAT"
+    elif score <= -2: signal = "🟡 ZAYIF SAT"
+    else:             signal = "⚪ BEKLE"
+
+    av = atr_.iloc[i]
+    if score > 0: tp = round(price + av*2.0, 6); sl = round(price - av*1.5, 6)
+    else:         tp = round(price - av*2.0, 6); sl = round(price + av*1.5, 6)
+    rr = round(abs(tp-price) / abs(sl-price), 2) if abs(sl-price) > 0 else 0
+
+    return {
+        "coin"  : inst_id.replace("-USDT-SWAP",""),
+        "price" : round(price, 5),
+        "signal": signal,
+        "score" : score,
+        "rsi"   : round(rv, 1),
+        "bb_pct": round(bbp_.iloc[i]*100, 1),
+        "ema_ok": e9.iloc[i] > e21.iloc[i],
+        "tp": tp, "sl": sl, "rr": rr,
+    }
+
+def format_signal_message(row):
+    direction = "LONG 📈" if row["score"] > 0 else "SHORT 📉"
+    return (
+        f"{row['signal']} — <b>{row['coin']}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 Fiyat   : <code>{row['price']}</code>\n"
+        f"📊 Skor    : <b>{row['score']:+d}</b>  |  {direction}\n"
+        f"📈 RSI     : {row['rsi']}\n"
+        f"📉 BB%     : {row['bb_pct']}\n"
+        f"✅ EMA 9>21: {'Evet' if row['ema_ok'] else 'Hayır'}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 TP      : <code>{row['tp']}</code>\n"
+        f"🛑 SL      : <code>{row['sl']}</code>\n"
+        f"⚖️  R/R     : {row['rr']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+def format_summary(results, scan_time):
+    buy  = sum(1 for r in results if r["score"] >= MIN_SCORE_ALERT)
+    sell = sum(1 for r in results if r["score"] <= -MIN_SCORE_ALERT)
+    return (
+        f"📡 <b>OKX TARAMA ÖZETI</b>\n"
+        f"🕐 {scan_time}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 AL  sinyali : <b>{buy}</b> coin\n"
+        f"🔴 SAT sinyali : <b>{sell}</b> coin\n"
+        f"⚪ Bekle       : <b>{len(results)-buy-sell}</b> coin\n"
+        f"📊 Toplam      : {len(results)} coin\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Eğitim amaçlıdır!"
+    )
+
+# ─────────────────────────────────────────────
+# ANA TARAMA
+# ─────────────────────────────────────────────
+def run_scan():
+    scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n{'='*55}")
+    print(f"  OKX 5DK SCANNER  |  {scan_time}")
+    print(f"{'='*55}")
+
+    try:
+        coins = get_top_coins(TOP_N_COINS)
+    except Exception as e:
+        print(f"❌ {e}")
+        return None
+
+    print(f"  ✅ {len(coins)} coin bulundu, taranıyor...\n")
+    results = []
+
+    for i, inst in enumerate(coins, 1):
+        try:
+            df = get_candles(inst, TIMEFRAME, LIMIT_CANDLES)
+            if df is None or len(df) < 60:
+                continue
+            row = generate_signal(df, inst)
+            results.append(row)
+
+            marker = "🟢" if row["score"]>=4 else "🔴" if row["score"]<=-4 else "⚪"
+            print(f"  [{i:02d}] {row['coin']:<12} {marker} {row['signal']:<18} {row['score']:+d}")
+
+            # Güçlü sinyal → Telegram'a gönder
+            if abs(row["score"]) >= MIN_SCORE_ALERT:
+                send_telegram(format_signal_message(row))
+                time.sleep(0.5)
+
+            time.sleep(0.12)
+        except:
+            continue
+
+    if not results:
+        print("❌ Sonuç alınamadı!")
+        return None
+
+    # Özet mesaj
+    send_telegram(format_summary(results, scan_time))
+
+    # Konsol tablosu
+    df_res = pd.DataFrame(results)
+    print(f"\n{'='*55}")
+    print(tabulate(
+        df_res.sort_values("score", ascending=False)
+              [["coin","price","signal","score","rsi","bb_pct","tp","sl","rr"]],
+        headers=["Coin","Fiyat","Sinyal","Skor","RSI","BB%","TP","SL","R/R"],
+        tablefmt="fancy_grid", showindex=False))
+
+    print(f"\n✅ Tamamlandı — {datetime.now().strftime('%H:%M:%S')}")
+    return df_res
+
+# ─────────────────────────────────────────────
+# ÇALIŞTIR
+# ─────────────────────────────────────────────
+
+# 1. Telegram testi
+print("🔄 Telegram test ediliyor...")
+test_telegram()
+
+# 2. Tek tarama
+df_sonuc = run_scan()
+
+sayi = 0
+while True:
+    sayi += 1
+    print(f"\n🔄 Tarama #{sayi}")
+    run_scan()
+    print(f"⏳ 5 dakika bekleniyor...")
+    time.sleep(SCAN_INTERVAL)
